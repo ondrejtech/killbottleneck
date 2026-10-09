@@ -8,3 +8,5 @@ kb-backup-*.tgz
 kb-backup-*.tgz.gpg
 pb_data.old/
 pb_data.restore-tmp*
+custom-backup/
+secreet-key/

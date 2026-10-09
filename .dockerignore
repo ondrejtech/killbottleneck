@@ -8,3 +8,6 @@ pb_data
 docs
 # Capacitor obal (Android projekt + APK buildy) — do image aplikace nepatří
 mobile
+# tajne hodnoty (hesla, klice) nikdy do build kontextu
+secreet-key
+custom-backup
