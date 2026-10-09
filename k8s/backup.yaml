@@ -1,0 +1,68 @@
+# Denní záloha dat killBottleneck: CronJob + PVC kb-backups (namespace killbottleneck)
+# Každý den ve 3:00 (Europe/Prague) vznikne kb-backup-<datum>.tgz, archivy starší 14 dní se mažou.
+# SQLite databáze se zálohují příkazem "sqlite3 .backup" (konzistentní i za běhu aplikace),
+# složka storage/ (nahrané soubory) se zkopíruje.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kb-backups
+  namespace: killbottleneck
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kb-backup
+  namespace: killbottleneck
+spec:
+  schedule: "0 3 * * *"
+  timeZone: "Europe/Prague"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            kubernetes.io/hostname: vps1      # PVC kb-data je vázané na tento uzel
+          containers:
+            - name: backup
+              image: alpine:3.20
+              env:
+                - name: KEEP_DAYS
+                  value: "14"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  for i in 1 2 3 4 5; do apk add --no-cache sqlite && break || sleep 10; done
+                  TS=$(date +%F-%H%M)
+                  W=/backups/work-$TS
+                  mkdir -p "$W"
+                  for f in /data/*.db; do
+                    [ -f "$f" ] && sqlite3 "$f" ".backup '$W/$(basename "$f")'"
+                  done
+                  [ -d /data/storage ] && cp -a /data/storage "$W/storage"
+                  tar czf "/backups/kb-backup-$TS.tgz" -C "$W" .
+                  rm -rf "$W"
+                  find /backups -name 'kb-backup-*.tgz' -mtime +"$KEEP_DAYS" -delete
+                  echo "OK: kb-backup-$TS.tgz"; ls -lh /backups
+              volumeMounts:
+                - { name: data, mountPath: /data }
+                - { name: backups, mountPath: /backups }
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: kb-data
+            - name: backups
+              persistentVolumeClaim:
+                claimName: kb-backups
