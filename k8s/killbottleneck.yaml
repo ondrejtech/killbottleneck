@@ -1,0 +1,194 @@
+# killBottleneck na k3s -> https://task.jaze.cz
+#
+# Před aplikací:
+#   1) kubectl create namespace killbottleneck
+#   2) kubectl -n killbottleneck create secret generic kb-secrets \
+#        --from-literal=KB_SETUP_CODE="$(openssl rand -base64 18)"
+#      (AI klíče se nastavují až v aplikaci: Administrace -> AI funkce)
+#   3) Secret superuživatele PocketBase (klíče email a password), viz Deploy.md.
+#   4) Pull secret pro registry.jaze.cz:
+#      kubectl -n killbottleneck create secret docker-registry registry-pull \
+#        --docker-server=registry.jaze.cz --docker-username=kb --docker-password="$HESLO"
+#
+# Aplikace: kubectl apply -f killbottleneck.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kb-config
+  namespace: killbottleneck
+data:
+  TZ: "Europe/Prague"
+  KB_PORT: "8090"
+  KB_PUBLIC_URL: "https://task.jaze.cz"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kb-data
+  namespace: killbottleneck
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: killbottleneck
+  namespace: killbottleneck
+spec:
+  replicas: 1                 # SQLite: nikdy víc replik
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: killbottleneck
+  template:
+    metadata:
+      labels:
+        app: killbottleneck
+    spec:
+      imagePullSecrets:
+        - name: registry-pull
+      nodeSelector:
+        kubernetes.io/hostname: vps1    # local-path PVC je vázané na node
+      initContainers:
+        # Jednorázové založení superuživatele PocketBase (konzole /_/).
+        # Běží jen tehdy, když na PVC chybí značka .superuser-created; po úspěchu se značka
+        # zapíše a při dalších startech se nic nedělá (nic se nepřepisuje, heslo se nemění).
+        # Při jiné chybě se značka nezapíše a pokus se zopakuje při dalším startu (aplikace se spustí).
+        # Údaje jsou v Secretu kb-superuser (klíče email a password).
+        - name: superuser
+          image: registry.jaze.cz/killbottleneck:v0.76-beta
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              M=/app/pb_data/.superuser-created
+              if [ -f "$M" ]; then echo "superuzivatel uz byl zalozen, preskakuji"; exit 0; fi
+              # pocketbase vraci i pri chybe exit code 0, proto se kontroluje vystup
+              OUT=$(/app/pocketbase superuser create "$KB_SU_EMAIL" "$KB_SU_PASSWORD" 2>&1 || true)
+              echo "$OUT"
+              case "$OUT" in
+                *"Successfully created"*) echo "superuzivatel zalozen"; touch "$M" ;;
+                *"must be unique"*)       echo "superuzivatel uz existuje, neprepisuji"; touch "$M" ;;
+                *) echo "CHYBA: superuzivatele se nepodarilo zalozit, zkusim to znovu pri dalsim startu" ;;
+              esac
+          env:
+            - name: KB_SU_EMAIL
+              valueFrom:
+                secretKeyRef: { name: kb-superuser, key: email }
+            - name: KB_SU_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: kb-superuser, key: password }
+          volumeMounts:
+            - name: data
+              mountPath: /app/pb_data
+      containers:
+        - name: killbottleneck
+          image: registry.jaze.cz/killbottleneck:v0.76-beta
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8090
+          envFrom:
+            - configMapRef:
+                name: kb-config
+            - secretRef:
+                name: kb-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /app/pb_data
+          readinessProbe:
+            tcpSocket:
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8090
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: killbottleneck
+  namespace: killbottleneck
+spec:
+  selector:
+    app: killbottleneck
+  ports:
+    - port: 80
+      targetPort: 8090
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: killbottleneck
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+# HTTPS + certifikát (cert-manager, ClusterIssuer "letsencrypt")
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: killbottleneck
+  namespace: killbottleneck
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [task.jaze.cz]
+      secretName: killbottleneck-tls
+  rules:
+    - host: task.jaze.cz
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: killbottleneck
+                port:
+                  number: 80
+---
+# HTTP -> HTTPS přesměrování (301)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: killbottleneck-redirect
+  namespace: killbottleneck
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: killbottleneck-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: task.jaze.cz
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: killbottleneck
+                port:
+                  number: 80
