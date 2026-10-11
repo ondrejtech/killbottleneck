@@ -1,0 +1,93 @@
+# LiteLLM proxy: OpenAI-kompatibilní brána před Vertex AI (Gemini), jen uvnitř clusteru.
+# killBottleneck umí jen statický klíč, Vertex chce OAuth token s hodinovou platností,
+# proxy proto drží klíč servisního účtu a navenek vydává OpenAI API se statickým klíčem.
+#
+# Před aplikací (z kořene repozitáře):
+#   kubectl -n killbottleneck create secret generic litellm-secrets \
+#     --from-file=LITELLM_MASTER_KEY=secreet-key/litellm-master-key \
+#     --from-file=vertex-sa.json=secreet-key/vertex-sa.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: killbottleneck
+data:
+  config.yaml: |
+    model_list:
+      - model_name: gemini-2.5-flash
+        litellm_params:
+          model: vertex_ai/gemini-2.5-flash
+          vertex_project: test-skola-jaze
+          vertex_location: europe-west4
+          # bez "přemýšlení": jinak model spotřebuje limit tokenů a odpověď je useknutá
+          reasoning_effort: disable
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+    litellm_settings:
+      drop_params: true
+      telemetry: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: killbottleneck
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm
+          # main-stable připnuté na digest (stav k 2026-10-11)
+          image: ghcr.io/berriai/litellm@sha256:60947db020b57e204823d3fbc8bb295c85be890d7c9adcc77fb4f5fc2fe410b2
+          args: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+          ports:
+            - containerPort: 4000
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /secrets/vertex-sa.json
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef: { name: litellm-secrets, key: LITELLM_MASTER_KEY }
+          volumeMounts:
+            - { name: config, mountPath: /etc/litellm, readOnly: true }
+            - { name: sa, mountPath: /secrets, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: 4000 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { memory: 1536Mi }
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+        - name: sa
+          secret:
+            secretName: litellm-secrets
+            items:
+              - { key: vertex-sa.json, path: vertex-sa.json }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: killbottleneck
+spec:
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000
