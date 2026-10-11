@@ -5,6 +5,7 @@
 #   2) kubectl -n killbottleneck create secret generic kb-secrets \
 #        --from-literal=KB_SETUP_CODE="$(openssl rand -base64 18)"
 #      (AI klíče se nastavují až v aplikaci: Administrace -> AI funkce)
+#   2b) Klíče AI do kb-secrets: viz Deploy.md, sekce 7 (KB_AI_TOKEN, KB_VISION_TOKEN)
 #   3) Secret superuživatele PocketBase (klíče email a password), viz Deploy.md.
 #   4) Pull secret pro registry.jaze.cz:
 #      kubectl -n killbottleneck create secret docker-registry registry-pull \
@@ -21,6 +22,15 @@ data:
   TZ: "Europe/Prague"
   KB_PORT: "8090"
   KB_PUBLIC_URL: "https://task.jaze.cz"
+  # AI: Gemini na Vertex AI přes LiteLLM proxy uvnitř clusteru (k8s/litellm.yaml).
+  # Klíč proxy (KB_AI_TOKEN, KB_VISION_TOKEN) je v Secretu kb-secrets.
+  # Obecné KB_AI_* platí pro asistenta, souhrny i hůlku; KB_VISION_* pro čtení obrázků.
+  KB_AI_PROVIDER: "openai"
+  KB_AI_URL: "http://litellm.killbottleneck.svc.cluster.local:4000/v1"
+  KB_AI_MODEL: "gemini-2.5-flash"
+  KB_VISION_PROVIDER: "openai"
+  KB_VISION_URL: "http://litellm.killbottleneck.svc.cluster.local:4000/v1"
+  KB_VISION_MODEL: "gemini-2.5-flash"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
