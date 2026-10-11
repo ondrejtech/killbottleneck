@@ -286,6 +286,41 @@ Bez nastaveného SMTP se nepošlou e-maily: pozvánky nových členů ukážou s
 upozornění chodí jen do zvonečku v aplikaci. SMTP se nastavuje v konzoli PocketBase
 (`/_/` → Settings → Mail settings), ne v proměnných prostředí.
 
+### SMTP (e-maily) přes API
+
+Místo klikání v konzoli `/_/` → Settings → Mail settings lze SMTP nastavit i příkazem. Heslo se čte
+ze souboru `secreet-key/smtp-credentials` (formát řádků `host:`, `port:`, `user:`, `password:`),
+takže není v historii shellu. Příklad pro `smtp.zoner.com`, port 587, STARTTLS:
+
+```bash
+TOK=$(printf '{"identity":"%s","password":"%s"}' \
+  "$(awk '/^email/{print $2}' secreet-key/pb-superuser-credentials)" \
+  "$(awk '/password/{print $2}' secreet-key/pb-superuser-credentials)" \
+  | curl -s -X POST https://task.jaze.cz/api/collections/_superusers/auth-with-password \
+      -H 'Content-Type: application/json' --data @- | python3 -I -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+python3 -I - <<'PY' | curl -s -X PATCH https://task.jaze.cz/api/settings \
+  -H "Authorization: $TOK" -H 'Content-Type: application/json; charset=utf-8' --data @-
+import json
+pw=[l.split(': ',1)[1].strip() for l in open('secreet-key/smtp-credentials') if l.startswith('password')][0]
+print(json.dumps({
+ "smtp":{"enabled":True,"host":"smtp.zoner.com","port":587,"username":"postmaster@jaze.cz",
+         "password":pw,"authMethod":"PLAIN","tls":False,"localName":""},
+ "meta":{"appName":"killBottleneck","appURL":"https://task.jaze.cz","senderName":"killBottleneck",
+         "senderAddress":"postmaster@jaze.cz","accentColor":"#1055c9","hideControls":False}}))
+PY
+
+# zkušební e-mail (204 = odesláno)
+curl -s -X POST https://task.jaze.cz/api/settings/test/email -H "Authorization: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"postmaster@jaze.cz","template":"verification","collection":"_superusers"}' -w "%{http_code}\n"
+```
+
+- `"tls": false` na portu 587 znamená STARTTLS (při `true` by se použilo implicitní TLS, typicky port 465).
+- `meta.appURL` musí být veřejná adresa, jinak by odkazy v e-mailech (reset hesla, ověření) mířily na
+  výchozí `http://localhost:8090`. `meta` se v PATCH nahrazuje celé, proto se posílají všechna pole.
+- Nastavení je v databázi (`pb_data`), takže je součástí zálohy a přežije restart.
+
 ## 7. Nastavení AI (DeepSeek)
 
 AI je ve výchozím stavu vypnutá a v manifestech **není nastavena**. Zapíná se až v aplikaci,
