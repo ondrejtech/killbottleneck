@@ -25,7 +25,7 @@ Dokument odpovídá skutečně provedenému nasazení (verze aplikace `v0.76-bet
 4. [Build a push image aplikace](#4-build-a-push-image-aplikace)
 5. [Aplikace `task.jaze.cz`](#5-aplikace-taskjazecz)
 6. [První spuštění aplikace](#6-první-spuštění-aplikace)
-7. [Nastavení AI (DeepSeek)](#7-nastavení-ai-deepseek)
+7. [Nastavení AI (Gemini na Vertex AI přes LiteLLM)](#7-nastavení-ai-gemini-na-vertex-ai-přes-litellm)
 8. [Provoz: aktualizace, restart, záloha](#8-provoz-aktualizace-restart-záloha)
 9. [Smazání z clusteru](#9-smazání-z-clusteru)
 10. [Diagnostika problémů](#10-diagnostika-problémů)
@@ -321,45 +321,125 @@ curl -s -X POST https://task.jaze.cz/api/settings/test/email -H "Authorization: 
   výchozí `http://localhost:8090`. `meta` se v PATCH nahrazuje celé, proto se posílají všechna pole.
 - Nastavení je v databázi (`pb_data`), takže je součástí zálohy a přežije restart.
 
-## 7. Nastavení AI (DeepSeek)
+## 7. Nastavení AI (Gemini na Vertex AI přes LiteLLM)
 
-AI je ve výchozím stavu vypnutá a v manifestech **není nastavena**. Zapíná se až v aplikaci,
-takže klíč není v žádném souboru v repozitáři.
+AI je ve výchozím stavu vypnutá. Používá se **Gemini na Vertex AI** (`gemini-2.5-flash`, region
+`europe-west4`, data zůstávají v EU). killBottleneck umí přes poskytovatele `openai` jen **statický
+klíč**, ale Vertex AI chce OAuth token s hodinovou platností. Mezi ně proto v clusteru běží
+**LiteLLM proxy**, která drží klíč servisního účtu a navenek vydává OpenAI-kompatibilní API
+se statickým klíčem. Proxy je dostupná jen uvnitř clusteru (bez ingressu).
 
-1. Přihlaste se jako správce → **Správa organizace** → **Administrace → AI funkce**.
-2. Zvolte **OpenAI a kompatibilní** a vyplňte:
-   - adresa: `https://api.deepseek.com/v1` (základní adresu ověřte v dokumentaci DeepSeeku),
-   - model: `deepseek-v4-pro` (případně `deepseek-flash`),
-   - API klíč z platformy DeepSeek.
-3. Klikněte na **Otestovat připojení**, pak v panelu asistenta zkuste akci, která vyvolá
-   potvrzovací kartu (ověří se tak volání nástrojů).
+```
+killBottleneck ──(http, statický klíč)──▶ litellm.killbottleneck.svc:4000 ──(klíč servisního účtu)──▶ Vertex AI
+```
+
+### 7.1 Google Cloud: servisní účet a klíč
+
+Projekt `test-skola-jaze` musí mít zapnuté `aiplatform.googleapis.com` a fakturaci. Pro killBottleneck
+se zakládá **vlastní** servisní účet jen s rolí `aiplatform.user` (volání modelů). Účty a klíče jiných
+aplikací se nepoužívají, aby šly oprávnění zrušit odděleně.
+
+```bash
+P=test-skola-jaze
+SA=killbottleneck-vertex
+
+gcloud services list --enabled --project=$P --format="value(config.name)" | grep aiplatform
+gcloud iam service-accounts create $SA --project=$P --display-name="killBottleneck Vertex AI (LiteLLM)"
+gcloud projects add-iam-policy-binding $P \
+  --member="serviceAccount:$SA@$P.iam.gserviceaccount.com" --role="roles/aiplatform.user" --condition=None
+
+# klíč servisního účtu rovnou do secreet-key (nikdy do gitu)
+umask 077
+gcloud iam service-accounts keys create secreet-key/vertex-sa.json \
+  --iam-account=$SA@$P.iam.gserviceaccount.com --project=$P
+
+# statický klíč proxy, který bude používat killBottleneck
+printf 'sk-kb-%s' "$(openssl rand -hex 24)" > secreet-key/litellm-master-key
+```
+
+Ověření modelu v regionu (odpověď nesmí být useknutá, viz poznámka o „přemýšlení“ níže):
+
+```bash
+T=$(gcloud auth print-access-token)
+curl -s -X POST -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+  "https://europe-west4-aiplatform.googleapis.com/v1/projects/$P/locations/europe-west4/publishers/google/models/gemini-2.5-flash:generateContent" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Odpověz jedním slovem: ahoj"}]}]}'
+```
+
+### 7.2 LiteLLM proxy v clusteru
+
+```bash
+kubectl -n killbottleneck create secret generic litellm-secrets \
+  --from-file=LITELLM_MASTER_KEY=secreet-key/litellm-master-key \
+  --from-file=vertex-sa.json=secreet-key/vertex-sa.json
+
+kubectl apply -f k8s/litellm.yaml
+kubectl -n killbottleneck rollout status deploy/litellm --timeout=240s
+```
+
+`k8s/litellm.yaml` obsahuje ConfigMap s konfigurací modelu, Deployment a Service. Obraz
+`ghcr.io/berriai/litellm` je připnutý na **digest** (`main-stable` ke dni nasazení), takže se
+nezmění beze změny manifestu. Model je v konfiguraci `vertex_ai/gemini-2.5-flash` s
+`reasoning_effort: disable`.
+
+**Proč se vypíná „přemýšlení“:** Gemini 2.5 Flash má uvažování ve výchozím stavu zapnuté a
+spotřebuje tím limit tokenů. Při zkoušce s limitem 50 tokenů šlo 45 na uvažování a odpověď měla
+jediné písmeno. Dokumentace killBottlenecku před takovým chováním varuje. S vypnutým uvažováním
+odpověď dojde celá a bez tokenů navíc.
+
+Ověření proxy (přes port-forward, klíč ze souboru):
+
+```bash
+kubectl -n killbottleneck port-forward svc/litellm 14000:4000 &
+curl -s -o /dev/null -w "%{http_code}\n" localhost:14000/v1/models        # 401 bez klíče
+printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' \
+  "$(cat secreet-key/litellm-master-key)" \
+  | curl -s -K - localhost:14000/v1/chat/completions \
+      -d '{"model":"gemini-2.5-flash","max_tokens":50,"messages":[{"role":"user","content":"Řekni ahoj."}]}'
+kill %1
+```
+
+### 7.3 Napojení killBottlenecku
+
+Adresa a model jsou v ConfigMapu `kb-config` (`k8s/killbottleneck.yaml`), klíč v Secretu `kb-secrets`.
+Obecné `KB_AI_*` platí pro asistenta, souhrny i hůlku, `KB_VISION_*` pro čtení obrázků.
+
+| Proměnná | Hodnota |
+| --- | --- |
+| `KB_AI_PROVIDER` | `openai` |
+| `KB_AI_URL` | `http://litellm.killbottleneck.svc.cluster.local:4000/v1` |
+| `KB_AI_MODEL` | `gemini-2.5-flash` |
+| `KB_AI_TOKEN` | klíč proxy (Secret `kb-secrets`) |
+| `KB_VISION_PROVIDER`, `KB_VISION_URL`, `KB_VISION_MODEL`, `KB_VISION_TOKEN` | stejné hodnoty pro obrázky |
+
+Secret `kb-secrets` se při změně aktualizuje celý, takže musí znovu obsahovat i registrační klíč:
+
+```bash
+kubectl -n killbottleneck create secret generic kb-secrets \
+  --from-file=KB_SETUP_CODE=secreet-key/kb-setup-code \
+  --from-file=KB_AI_TOKEN=secreet-key/litellm-master-key \
+  --from-file=KB_VISION_TOKEN=secreet-key/litellm-master-key \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f k8s/killbottleneck.yaml
+kubectl -n killbottleneck rollout restart deploy/killbottleneck
+```
+
+Ověření: `curl -s https://task.jaze.cz/api/kb/config` musí vrátit `"ai_enabled": true` a v
+`ai_modes` mimo jiné `chat_panel` a `chat_image`. Po přihlášení se v horní liště zobrazí tlačítko
+asistenta.
 
 Poznámky:
 
-- **Uvažování (thinking):** DeepSeek má uvažování ve výchozím stavu zapnuté. Dokumentace
-  killBottlenecku varuje, že uvažující modely jsou pomalé, drahé a mohou spotřebovat celý limit
-  tokenů a nevrátit nic. Vypíná se parametrem `thinking: {"type": "disabled"}`. Aplikace ho umí
-  poslat v proměnné `KB_CHAT_OPENAI_EXTRA` (pro obecnou AI `KB_AI_OPENAI_EXTRA`):
-  ```yaml
-  # do ConfigMapu kb-config v k8s/killbottleneck.yaml
-  KB_CHAT_PROVIDER: "openai"
-  KB_CHAT_URL: "https://api.deepseek.com/v1"
-  KB_CHAT_MODEL: "deepseek-v4-pro"
-  KB_CHAT_OPENAI_EXTRA: '{"thinking":{"type":"disabled"}}'
-  ```
-  Klíč `KB_CHAT_TOKEN` patří do Secretu, ne do ConfigMapu:
-  ```bash
-  kubectl -n killbottleneck patch secret kb-secrets --type merge \
-    -p "{\"stringData\":{\"KB_CHAT_TOKEN\":\"$DEEPSEEK_KEY\"}}"
-  kubectl -n killbottleneck rollout restart deploy/killbottleneck
-  ```
-- **Obrázky:** podle dokumentace DeepSeeku zprávy podporují `image_url`. Čtení obrázků se zapíná
-  proměnnými `KB_VISION_*` (nebo v Administraci volbou „Asistent čte obrázky“).
-- **Hlasovky:** pro DeepSeek jsem v dokumentaci nenašel přepis řeči, mikrofon se proto neukáže.
-- **Soukromí:** s poskytovatelem jiným než `none` se data map a rozhovorů posílají na zadaný
-  endpoint, tedy na API DeepSeeku.
-- Kompatibilitu `deepseek-v4-pro` s tímto produktem dokumentace killBottlenecku neuvádí.
-  Ověřte ji tlačítkem **Otestovat připojení** a vyzkoušením asistenta.
+- **Hlasovky:** vyžadují přepis řeči ve tvaru OpenAI (`/audio/transcriptions`), který tahle
+  konfigurace nenabízí. Mikrofon se proto neukáže. Přepis lze doplnit samostatně (`KB_TRANSCRIBE_*`).
+- **Soukromí:** data map a rozhovorů odcházejí do Vertex AI v projektu `test-skola-jaze`
+  (region `europe-west4`).
+- **Náklady:** volání Vertex AI se účtuje na projekt. Hodinový strop `KB_AI_MAX_PER_HOUR` (60) platí
+  na osobu, týdenní kvótu lze nastavit v Administraci → AI kredity.
+- **Rotace klíčů:** klíč proxy změníte novým souborem v `secreet-key/`, aktualizací obou Secretů
+  (`litellm-secrets`, `kb-secrets`) a restartem obou Deploymentů. Klíč servisního účtu se ruší
+  příkazem `gcloud iam service-accounts keys delete KEY_ID --iam-account=... --project=...`.
 
 ## 8. Provoz: aktualizace, restart, záloha
 
@@ -649,9 +729,10 @@ kubectl -n killbottleneck delete pod -l app=killbottleneck     # urychlí nový 
 | --- | --- | --- |
 | Heslo registry (uživatel `kb`) | `secreet-key/registry-jaze-credentials` (práva 600) | v clusteru jako Secret `registry-basic-auth` (htpasswd) a `registry-pull` |
 | Registrační klíč instance | `secreet-key/kb-setup-code` (práva 600) | v clusteru jako Secret `kb-secrets` (`KB_SETUP_CODE`) |
+| Klíč servisního účtu Google Cloud | `secreet-key/vertex-sa.json` (práva 600) | v clusteru jako Secret `litellm-secrets` |
+| Klíč LiteLLM proxy | `secreet-key/litellm-master-key` (práva 600) | Secrety `litellm-secrets` a `kb-secrets` (`KB_AI_TOKEN`, `KB_VISION_TOKEN`) |
 | Přihlášení dockeru k registry | `secreet-key/docker/config.json` (práva 600, `DOCKER_CONFIG`) | jen lokálně, obsahuje heslo registry v base64 |
 | Superuživatel PocketBase (`/_/`) | `secreet-key/pb-superuser-credentials` (práva 600) | v clusteru jako Secret `kb-superuser`; používá se jen při prvním založení |
-| API klíč AI (DeepSeek) | zadává se v aplikaci (Administrace), případně Secret `kb-secrets` | nepatří do ConfigMapu ani do gitu |
 
 Do gitu nikdy nepatří soubory s hesly ani zálohy dat. Heslo zadané na příkazové řádce
 (například `superuser upsert EMAIL HESLO`) zůstává v historii shellu, po použití ho změňte
