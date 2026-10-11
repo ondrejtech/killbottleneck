@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "killbottleneck": {
+      "command": "npx",
+      "args": ["-y", "killbottleneck-mcp"],
+      "env": {
+        "KB_URL": "https://task.jaze.cz",
+        "KB_API_KEY": "${KB_API_KEY}"
+      }
+    }
+  }
+}
